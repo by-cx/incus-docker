@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -eq 0 ]; then
+    if ! podman container exists incus; then
+        echo "Incus is not installed or its container is unavailable." >&2
+        echo "Check it with: systemctl status incus.service" >&2
+        exit 1
+    fi
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        exec podman exec --interactive --tty incus /usr/bin/incus "$@"
+    fi
+
+    exec podman exec --interactive incus /usr/bin/incus "$@"
+else
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "sudo is required to access the rootful Incus container." >&2
+        exit 1
+    fi
+fi
+
+if ! sudo podman container exists incus; then
+    echo "Incus is not installed or its container is unavailable." >&2
+    echo "Check it with: sudo systemctl status incus.service" >&2
+    exit 1
+fi
+
+if [ -t 0 ] && [ -t 1 ]; then
+    exec sudo podman exec --interactive --tty incus /usr/bin/incus "$@"
+fi
+
+exec sudo podman exec --interactive incus /usr/bin/incus "$@"

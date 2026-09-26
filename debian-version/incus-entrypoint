@@ -1,0 +1,81 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+if (( $# > 0 )); then
+    exec "$@"
+fi
+
+lxcfs_pid=
+incusd_pid=
+waitready_pid=
+ready=false
+stopping=false
+
+stop_process() {
+    local pid="$1"
+
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+        kill -TERM "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
+    fi
+}
+
+cleanup() {
+    if [[ "${stopping}" == true ]]; then
+        return
+    fi
+
+    stopping=true
+    trap - EXIT INT TERM
+
+    stop_process "${waitready_pid}"
+
+    if [[ "${ready}" == true ]] && [[ -n "${incusd_pid}" ]] && kill -0 "${incusd_pid}" 2>/dev/null; then
+        timeout 300 incus admin shutdown >/dev/null 2>&1 || true
+    fi
+
+    stop_process "${incusd_pid}"
+    stop_process "${lxcfs_pid}"
+    fusermount3 -u /var/lib/incus-lxcfs 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+if [[ -n "${KVM_GID:-}" ]] && getent group kvm >/dev/null; then
+    echo "Matching the container kvm group to host GID ${KVM_GID}"
+    groupmod --non-unique -g "${KVM_GID}" kvm
+fi
+
+if [[ "${SETIPTABLES:-false}" == true ]]; then
+    for command in iptables ip6tables iptables-legacy ip6tables-legacy; do
+        if command -v "${command}" >/dev/null && "${command}" -nL DOCKER-USER >/dev/null 2>&1; then
+            "${command}" -C DOCKER-USER -j ACCEPT >/dev/null 2>&1 || \
+                "${command}" -I DOCKER-USER -j ACCEPT
+        fi
+    done
+fi
+
+mkdir -p /var/lib/incus-lxcfs /var/log/incus
+
+lxcfs /var/lib/incus-lxcfs --enable-loadavg --enable-cfs &
+lxcfs_pid=$!
+
+incusd --group incus-admin --logfile /var/log/incus/incusd.log &
+incusd_pid=$!
+
+incus admin waitready --timeout=600 &
+waitready_pid=$!
+if ! wait "${waitready_pid}"; then
+    echo "Incus failed to become ready" >&2
+    exit 1
+fi
+waitready_pid=
+ready=true
+
+set +e
+wait -n "${lxcfs_pid}" "${incusd_pid}"
+status=$?
+set -e
+
+echo "An essential Incus process exited with status ${status}" >&2
+exit "${status}"

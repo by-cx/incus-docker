@@ -1,83 +1,79 @@
-# Use the official Debian Bookworm base image
-FROM debian:bookworm-slim
+# syntax=docker/dockerfile:1
 
-# We make a fake systemctl so that incus doesn't error out without systemd
-RUN echo "#!/bin/bash" > /sbin/systemctl && \
-    echo "exit 0" >> /sbin/systemctl && \
-    chmod +x /sbin/systemctl && \
-    echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list && \
-# Install curl so we can install the keyring.
-    apt-get update && \
-    apt-get install --no-install-recommends -y curl ca-certificates && \
-    mkdir -p /etc/apt/keyrings/ && \
-    curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc && \
-    echo "deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/stable $(. /etc/os-release && echo ${VERSION_CODENAME}) main" > /etc/apt/sources.list.d/zabbly-incus-stable.list && \
-# Install incus and dependencies
-# Added 'passwd' to ensure groupmod is available for GID mapping
-    apt-get update && \
-    apt-get install --no-install-recommends -y fuse nftables ebtables arptables iproute2 thin-provisioning-tools openvswitch-switch btrfs-progs lvm2 udev iptables kmod passwd && \
-    apt-get install --no-install-recommends --no-install-suggests -y zfsutils-linux && \
-    apt-get install --no-install-recommends -y incus incus-ui-canonical && \
-    apt-get remove -y curl && \
-    apt autoremove -y && \
-    apt-get clean && \
-# Generate the start.sh script
-    echo '#!/bin/bash' > /start.sh && \
-    echo 'trap "cleanup; exit" SIGTERM' >> /start.sh && \
-    echo 'cleanup() {' >> /start.sh && \
-    echo '  echo "Stopping incusd..."' >> /start.sh && \
-    echo '  incus admin shutdown' >> /start.sh && \
-    echo '  pkill -TERM incusd' >> /start.sh && \
-    echo '  echo "Stopped incusd."' >> /start.sh && \
-    echo '  echo "Stopping lxcfs..."' >> /start.sh && \
-    echo '  pkill -TERM lxcfs' >> /start.sh && \
-    echo '  fusermount -u /var/lib/incus-lxcfs' >> /start.sh && \
-    echo '  echo "Stopped lxcfs."' >> /start.sh && \
-    echo '  CHILD_PIDS=$(pgrep -P $$)' >> /start.sh && \
-    echo '  if [ -n "$CHILD_PIDS" ]; then' >> /start.sh && \
-    echo '    pkill -TERM -P $$' >> /start.sh && \
-    echo '    echo "Stopped child processes with PIDs: $CHILD_PIDS"' >> /start.sh && \
-    echo '  else' >> /start.sh && \
-    echo '    echo "No child processes found."' >> /start.sh && \
-    echo '  fi' >> /start.sh && \
-    echo '}' >> /start.sh && \
-# Map KVM GID if provided as an Environment Variable
-    echo 'if [ -n "$KVM_GID" ]; then' >> /start.sh && \
-    echo '  echo "Updating container kvm group to GID $KVM_GID to match host..."' >> /start.sh && \
-    echo '  groupmod -g "$KVM_GID" kvm || true' >> /start.sh && \
-    echo 'fi' >> /start.sh && \
-# Environment Exports
-    echo 'export PATH="/opt/incus/bin/:${PATH}"' >> /start.sh && \
-    echo 'export INCUS_EDK2_PATH="/opt/incus/share/qemu/"' >> /start.sh && \
-    echo 'export LD_LIBRARY_PATH="/opt/incus/lib/"' >> /start.sh && \
-    echo 'export INCUS_LXC_TEMPLATE_CONFIG="/opt/incus/share/lxc/config/"' >> /start.sh && \
-    echo 'export INCUS_DOCUMENTATION="/opt/incus/doc/"' >> /start.sh && \
-    echo 'export INCUS_LXC_HOOK="/opt/incus/share/lxc/hooks/"' >> /start.sh && \
-    echo 'export INCUS_AGENT_PATH="/opt/incus/agent/"' >> /start.sh && \
-    echo 'export INCUS_UI="/opt/incus/ui/"' >> /start.sh && \
-# Iptables handling
-    echo 'if [ "$SETIPTABLES" = "true" ]; then' >> /start.sh && \
-    echo '  if ! iptables-legacy -C DOCKER-USER -j ACCEPT &>/dev/null; then' >> /start.sh && \
-    echo '    iptables-legacy -I DOCKER-USER -j ACCEPT' >> /start.sh && \
-    echo '  fi' >> /start.sh && \
-    echo '  if ! ip6tables-legacy -C DOCKER-USER -j ACCEPT &>/dev/null; then' >> /start.sh && \
-    echo '    ip6tables-legacy -I DOCKER-USER -j ACCEPT' >> /start.sh && \
-    echo '  fi' >> /start.sh && \
-    echo '  if ! iptables -C DOCKER-USER -j ACCEPT &>/dev/null; then' >> /start.sh && \
-    echo '    iptables -I DOCKER-USER -j ACCEPT' >> /start.sh && \
-    echo '  fi' >> /start.sh && \
-    echo '  if ! ip6tables -C DOCKER-USER -j ACCEPT &>/dev/null; then' >> /start.sh && \
-    echo '    ip6tables -I DOCKER-USER -j ACCEPT' >> /start.sh && \
-    echo '  fi' >> /start.sh && \
-    echo 'fi' >> /start.sh && \
-# Start services
-    echo '  mkdir -p /var/lib/incus-lxcfs' >> /start.sh && \
-    echo '  /opt/incus/bin/lxcfs /var/lib/incus-lxcfs --enable-loadavg --enable-cfs &' >> /start.sh && \
-    echo '/usr/lib/systemd/systemd-udevd &' >> /start.sh && \
-    echo 'UDEVD_PID=$!' >> /start.sh && \
-    echo '/opt/incus/bin/incusd &' >> /start.sh && \
-    echo 'sleep infinity' >> /start.sh && \    
-    chmod +x /start.sh
+FROM debian:trixie-slim
 
-# Run the incusd binary via start.sh
-CMD ["/start.sh"]
+ARG INCUS_CHANNEL=stable
+ARG ZABBLY_KEY_FINGERPRINT=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
+
+ENV HOME=/var/lib/incus \
+    INCUS_AGENT_PATH=/opt/incus/agent/ \
+    INCUS_DOCUMENTATION=/opt/incus/doc/ \
+    INCUS_EDK2_PATH=/opt/incus/share/qemu/ \
+    INCUS_LXC_HOOK=/opt/incus/share/lxc/hooks/ \
+    INCUS_LXC_TEMPLATE_CONFIG=/opt/incus/share/lxc/config/ \
+    INCUS_UI=/opt/incus/ui/ \
+    LD_LIBRARY_PATH=/opt/incus/lib/ \
+    PATH=/opt/incus/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    case "${INCUS_CHANNEL}" in \
+        stable|daily|lts-7.0) ;; \
+        *) echo "Unsupported Incus channel: ${INCUS_CHANNEL}" >&2; exit 1 ;; \
+    esac; \
+    printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/systemctl; \
+    chmod 0755 /usr/local/bin/systemctl; \
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; \
+    chmod 0755 /usr/sbin/policy-rc.d; \
+    sed -i 's/^Components: main$/Components: main contrib/' /etc/apt/sources.list.d/debian.sources; \
+    apt-get update; \
+    apt-get install --no-install-recommends -y ca-certificates curl gnupg; \
+    mkdir -m 0700 /tmp/gnupg; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc; \
+    test "$(gpg --batch --homedir /tmp/gnupg --show-keys --with-colons /etc/apt/keyrings/zabbly.asc | grep '^fpr:' | cut -d: -f10 | head -n1)" = "${ZABBLY_KEY_FINGERPRINT}"; \
+    rm -rf /tmp/gnupg; \
+    printf '%s\n' \
+        'Enabled: yes' \
+        'Types: deb' \
+        "URIs: https://pkgs.zabbly.com/incus/${INCUS_CHANNEL}" \
+        'Suites: trixie' \
+        'Components: main' \
+        "Architectures: $(dpkg --print-architecture)" \
+        'Signed-By: /etc/apt/keyrings/zabbly.asc' \
+        > /etc/apt/sources.list.d/zabbly-incus.sources; \
+    apt-get update; \
+    apt-get install --no-install-recommends -y \
+        arptables \
+        btrfs-progs \
+        ebtables \
+        fuse3 \
+        incus \
+        incus-ui-canonical \
+        iproute2 \
+        iptables \
+        kmod \
+        lvm2 \
+        nftables \
+        openvswitch-switch \
+        passwd \
+        thin-provisioning-tools \
+        zfsutils-linux; \
+    rm -f /usr/local/bin/systemctl /usr/sbin/policy-rc.d; \
+    rm -rf /var/lib/apt/lists/*; \
+    test -x /opt/incus/bin/incusd; \
+    test -x /opt/incus/bin/lxcfs; \
+    test -d /opt/incus/share/qemu
+
+COPY incus-entrypoint /usr/local/sbin/incus-entrypoint
+COPY incus-healthcheck /usr/local/bin/incus-healthcheck
+
+RUN chmod 0755 /usr/local/sbin/incus-entrypoint /usr/local/bin/incus-healthcheck
+
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/incus-healthcheck"]
+
+ENTRYPOINT ["/usr/local/sbin/incus-entrypoint"]

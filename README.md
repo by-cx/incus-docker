@@ -1,158 +1,187 @@
-# incus-docker
-A project to run incus in docker/podman
+# Incus container
 
-Incus is a fork of lxd. Please see here:
-https://linuxcontainers.org/incus/
+Run the Incus daemon and web UI in a privileged Podman or Docker container.
+The image is based on Debian 13 (Trixie) and the packages maintained by
+[Zabbly](https://github.com/zabbly/incus).
 
-This project aims to maintain a Dockerfile to run incus in a docker/podman container.
-It also installs the incus-ui-canonical to have a Web-based UI.
+This is a maintained fork of
+[cmspam/incus-docker](https://github.com/cmspam/incus-docker). It removes the
+Alpine variants and keeps one Debian image definition for all release channels.
 
-*Versions*
+## Images
 
-* Debian version: I recommend using this with any glibc-based distributions. This is based off of zabbly/incus stable builds ( https://github.com/zabbly/incus )
+Images are published for `linux/amd64` and `linux/arm64`:
 
-* Alpine version: Available, only in Dockerfile form. These will not be prioritized.
+| Image | Zabbly channel | Purpose |
+| --- | --- | --- |
+| `ghcr.io/by-cx/incus-docker:latest` | `stable` | Current Incus feature release |
+| `ghcr.io/by-cx/incus-docker:daily` | `daily` | Untested daily Incus build |
+| `ghcr.io/by-cx/incus-docker:lts` | `lts-7.0` | Incus 7.0 LTS |
 
-* Alpine no-vm version: Available, only in Dockerfile form. This is a smaller iamge which doesn't have qemu/VM functionality.
+All three images are built from `debian-version/Dockerfile` on the `main`
+branch. The Zabbly `incus` package includes QEMU, the Incus agent, and the
+firmware under `/opt/incus/share/qemu`; host OVMF mounts are not required.
 
-*Branches*
+## Security model
 
-You can pull from:
-* incus-docker:latest -- The default choice. The latest stable version of Incus (Debian based)
-* incus-docker:daily -- The daily builds from zabbly/incus (Debian based)
-* incus-docker:lts -- The 6.0 LTS version of incus. (Debian based)
+Incus is a system container and virtual-machine manager. Running it inside
+another container still requires broad access to the host:
 
-How to use it:
+- The outer container is privileged.
+- It shares the host network, PID namespace, and cgroup namespace.
+- It can load host kernel modules through a read-only `/lib/modules` mount.
+- Anyone with Incus administrator access can effectively gain root access to
+  the host.
 
-*Note*: If you use the environment variable SETIPTABLES=true, it will be adding:
-```
-iptables (or iptables-legacy) -I DOCKER-USER -j ACCEPT
-ip6tables (or ip6tables-legacy) -I DOCKER-USER -j ACCEPT
-```
+Use this only on a host where the Incus administrators are trusted as host
+administrators. Native Incus packages are preferable when the host operating
+system provides them.
 
-The reason is that, without doing this, docker's iptables settings will be blocking the connections from the incus bridge you create, and your containers/vms will not be able to access the internet. If you use podman, it's not needed.
+## Install with Podman
 
-# To use the image
+Requirements:
 
-First, make the directory to hold incus configuration:
-``` mkdir /var/lib/incus ```
+- Linux with cgroup v2
+- systemd
+- rootful Podman with Quadlet support
+- `sudo`
 
+Clone the repository and run:
 
-With Podman (needs root permissions) (recommended):
-```
-sudo podman run -d \
---name incus \
---log-driver=none \
---cgroups=no-conmon \
---cgroupns=host \
---security-opt unmask=/sys/fs/cgroup \
---privileged \
---network host \
---pid=host \
---volume /dev:/dev \
---volume /var/lib/incus:/var/lib/incus \
---volume /lib/modules:/lib/modules:ro \
-ghcr.io/cmspam/incus-docker:latest
+```sh
+sudo ./install.sh
 ```
 
-Incus writes its daemon and instance logs under `/var/log/incus` and exposes
-its event stream through the Incus API. Disabling Podman's log driver also
-prevents long-lived LXC monitor processes from inheriting conmon's logging
-pipe. Otherwise replacing the daemon container while guests remain running
-can leave the old conmon waiting for those guests to close that pipe.
+When invoked through `sudo`, the script installs the client wrapper into
+`~/.local/bin/incus` for the user who invoked `sudo`. To select another user:
 
-With Docker:
-
-```
-docker run -d \
---name incus \
---privileged \
---env SETIPTABLES=true \
---restart unless-stopped \
---network host \
---pid=host \
---cgroupns=host \
---volume /dev:/dev \
---volume /var/lib/incus:/var/lib/incus \
---volume /lib/modules:/lib/modules:ro \
-ghcr.io/cmspam/incus-docker:latest
+```sh
+sudo ./install.sh --user USER
 ```
 
-# Fixing cgroups issue
+An unmarked, non-empty `/var/lib/incus` is not adopted automatically because
+it might belong to a native Incus installation. If it is intentionally the
+state of an older container deployment, use `sudo ./install.sh --adopt-bind`.
 
-If you run 'podman logs incus' you may see an error such as
-```
-level=error msg="balance: Unable to set cpuset" err="setting cgroup item for the container failed"
-name=(container) value="0,1,2,3"
-```
-This can be fixed by making sure you run with the option:
-```--pid=host```
+The installer:
 
-# Host Device Permissions (KVM GID)
+- validates Podman and the Quadlet files;
+- pulls `ghcr.io/by-cx/incus-docker:latest`;
+- installs the Quadlet under `/etc/containers/systemd`;
+- reloads systemd and starts or replaces `incus.service`;
+- waits for the daemon health check;
+- installs or updates the client wrapper.
 
-If you are running this container on a host where you also run other virtualization tools (like libvirt or qemu on RHEL, CoreOS, or Fedora), the container's internal udevd might change the ownership of /dev/kvm and break your host's virtual machines.
+It is idempotent. To update the repository configuration and running image:
 
-To prevent this, find your host's KVM group ID:
-```
-getent group kvm | cut -d: -f3
-```
-
-Pass this value (e.g., 36 for RHEL/CoreOS) as an environment variable KVM_GID. This forces the container to use your host's ID, ensuring both the host and Incus can access the device simultaneously.
-
-Example: add `-e KVM_GID=36` to your command if kvm is group 36.
-
-# AppArmor
-
-If you have AppArmor enabled on your setup, you may need to add permissions to dnsmasq so that it can work with Incus without permission errors.  Here is an example of how to do so with OpenSuse Tumbleweed, but it should be similar for other distributions.
-
-Please edit the file:
-```/etc/apparmor.d/usr.sbin.dnsmasq```
-
-You will find a line like below, for Tumbleweed it was line 56 or so:
- ```/var/log/dnsmasq*.log w,```
-
-Under that line, please add
- ```/var/lib/incus/** rw,```
-
-
-If you want to use AppArmor functionality in incus, you can pass it through to the container by adding:
-
-```--volume /sys/kernel/security:/sys/kernel/security```
-
-# OpenVSwitch
-
-If you use OpenVSwitch, add this line to your docker/podman command:
-```--volume /run/openvswitch:/run/openvswitch```
-
-# Alpine-based Image
-
-NOTE: If you are using the alpine version with a glibc-based image, you can't depend on the ability to load the modules for VMs automatically. You should set up your environment to automatically load vhost_vsock and kvm modules. You can do it like this:
-
-```
-echo "vhost_vsock" > /etc/modules-load.d/incus.conf
-echo "kvm" >> /etc/modules-load.d/incus.conf
+```sh
+git pull --ff-only
+sudo ./install.sh
 ```
 
-# Management
+The script intentionally does not update its own Git checkout.
 
-After you start the container, incus will be running. If you used the folder I suggested and used host networking, you can manage it immediately with the incus binary from the same machine. Grab the binary from the latest releases here:
+### Persistent storage
 
-https://github.com/lxc/incus/releases
+Clean installations use the Podman volume `incus-data` for `/var/lib/incus`.
+If the installer finds a non-empty host `/var/lib/incus`, it keeps that bind
+mount when an existing Quadlet or `--adopt-bind` confirms ownership. It refuses
+ambiguous cases where both the host directory and named volume might contain
+state. The decision is recorded in
+`/etc/containers/systemd/incus-storage-mode` and reused on later runs.
 
-For example, I use bin.linux.incus.x86_64 from the Assets at the above link.
+Back up Incus before image upgrades. Incus can migrate its database schema
+forward, and an older daemon might not be able to use the upgraded database.
 
-You can then run **chmod +x bin.linux.incus.x86_64** to make it executable. Let's rename it to incus by running  **mv bin.linux.incus.x86_64 incus**
+### Environment
 
-Now we can check it's working by running
+The installer creates `/etc/incus-container.env` if it does not exist and never
+overwrites an existing file. Supported compatibility options include:
 
-```./incus admin init```
+```ini
+# Needed only for Docker hosts whose DOCKER-USER rules block Incus bridges.
+SETIPTABLES=true
 
-And we can proceed to configure incus.
+# Optional host kvm group ID if device ownership needs to be matched.
+KVM_GID=36
+```
 
-I find it easiest to move the binary to /usr/local/bin so that I can just run **incus admin init** or whatever other incus command I need from PATH.
+`SETIPTABLES=true` inserts an unrestricted `ACCEPT` rule into the host's
+`DOCKER-USER` chain. It is normally unnecessary with Podman.
 
-If you configure it to be manageable from the network, we can access the web UI, at https://{YOUR IP}:8443
+## Client access
 
-I have successfully tested on both arm64 and x86_64, on ClearLinux (x86_64) and OpenSuse MicroOS (x86_64, arm64). If your distribution has a native Incus package, it's best to use it.
+The installed `~/.local/bin/incus` wrapper runs the matching client inside the
+daemon container:
 
-The focus is on x86_64 and arm64, but other platforms may work if you build the Alpine-based Dockerfile.
+```sh
+incus admin init
+incus list
+incus launch images:debian/13 c1
+```
+
+Because the deployment uses rootful Podman, the wrapper invokes Podman through
+`sudo`. It preserves interactive terminals and also works in pipelines.
+
+Paths passed to commands such as `incus file push` are interpreted inside the
+outer container, not on the host. For native host path handling, download the
+official static Linux client from the
+[Incus releases](https://github.com/lxc/incus/releases/latest) and connect to
+the daemon over HTTPS. Copying `/usr/bin/incus` out of this image is not
+sufficient: the Zabbly wrapper expects `/opt/incus/bin` and `/opt/incus/lib`.
+
+## Service management
+
+```sh
+sudo systemctl status incus.service
+sudo systemctl restart incus.service
+sudo journalctl -u incus.service
+sudo podman inspect incus
+```
+
+The Podman log driver is disabled intentionally. Incus writes daemon and
+instance logs under `/var/log/incus` and its persistent state directory.
+Disabling the outer log pipe lets the daemon container be replaced while
+long-lived instance monitor processes continue running.
+
+The image health check uses `incus admin waitready`. An unhealthy daemon is
+terminated by Podman and restarted by systemd.
+
+## Manual Quadlet installation
+
+The portable source files are in `quadlet/`:
+
+- `incus.container`
+- `incus-data.volume`
+- `incus-environment.conf`
+- `incus-bind-storage.conf`
+
+The installer is recommended because it handles storage selection, environment
+configuration, image updates, validation, and the host wrapper consistently.
+
+## Host resources
+
+The default Quadlet does not mount `/dev`, a home directory, host firmware, or
+a fixed host state directory on clean installations. Privileged Podman exposes
+the required devices. `/lib/modules` remains host-mounted because modules must
+match the running host kernel.
+
+Additional host paths are deployment-specific. For example, a host directory
+used as the source of an Incus disk device must also be visible at the same
+path inside the outer container. Add such mounts through a Quadlet drop-in
+rather than modifying the installed file.
+
+OpenVSwitch users can similarly add `/run/openvswitch:/run/openvswitch` through
+a drop-in. Hosts using AppArmor may need to expose `/sys/kernel/security` and
+adjust their host profiles.
+
+## Docker
+
+Podman Quadlet is the maintained deployment path. The image can still run with
+Docker using equivalent privileged, host-network, host-PID, host-cgroup, state,
+and `/lib/modules` options. Set `SETIPTABLES=true` only when Docker's forwarding
+rules block traffic from Incus bridges.
+
+## License
+
+Licensed under the Apache License 2.0. See `LICENSE`.
