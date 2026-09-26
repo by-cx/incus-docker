@@ -9,6 +9,9 @@ keeps Incus state outside the image, installs a matching client wrapper, and
 provides enough time for Incus to shut down its instances during service or
 host shutdown.
 
+The maintainer runs this deployment on Fedora Silverblue and uses Fedora
+Silverblue as the primary test environment.
+
 ## Images
 
 Images are published for `linux/amd64` and `linux/arm64`:
