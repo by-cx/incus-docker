@@ -90,8 +90,7 @@ The script is safe to run repeatedly. On each run it:
 2. Checks required commands, cgroup v2, and the Podman Quadlet generator.
 3. Refuses to replace an existing `incus.service` that it does not manage,
    protecting a possible native Incus installation.
-4. Validates or adopts the persistent state at `/var/lib/incus` and migrates
-   state created by an older version of this installer from its named volume.
+4. Validates or adopts the persistent state at `/var/lib/incus`.
 5. Validates the assembled Quadlet configuration before changing the installed
    service.
 6. Creates or reuses the host `incus-admin` group, adds the selected user, and
@@ -120,15 +119,6 @@ adopt an existing directory intentionally on the first run:
 ```sh
 sudo ./install.sh --adopt-bind
 ```
-
-Installations made by an earlier version of this installer might use the
-Podman volume `incus-data`. When its storage marker says `volume`, or the
-installed legacy Quadlet clearly references that volume, an update stops
-Incus, copies the volume to `/var/lib/incus`, switches the Quadlet to the bind
-mount, and then starts Incus from the copied state. Migration is refused if
-`/var/lib/incus` contains unrelated data. Interrupted installer migrations are
-resumed without overwriting an already activated bind copy. The old volume is
-retained as a backup and is not removed automatically.
 
 The selected bind mode is recorded in
 `/etc/containers/systemd/incus-storage-mode` and reused on future runs.

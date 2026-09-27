@@ -6,9 +6,7 @@ IMAGE=ghcr.io/by-cx/incus-docker:latest
 QUADLET_DIR=/etc/containers/systemd
 ENVIRONMENT_FILE=/etc/incus-container.env
 STORAGE_MARKER=${QUADLET_DIR}/incus-storage-mode
-MIGRATION_MARKER=${QUADLET_DIR}/incus-volume-migration
 STATE_DIR=/var/lib/incus
-LEGACY_VOLUME=incus-data
 HOST_ACCESS_DROPIN=${QUADLET_DIR}/incus.container.d/30-host-access.conf
 
 usage() {
@@ -69,7 +67,7 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-for command in chmod chown cp cut find getent grep groupadd install mktemp mv podman rm rmdir sha256sum stat systemctl tr usermod; do
+for command in chmod chown cut find getent grep groupadd install mktemp mv podman rm sha256sum stat systemctl tr usermod; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         echo "Required command not found: ${command}" >&2
         exit 1
@@ -116,27 +114,16 @@ if [ -z "${quadlet_generator}" ]; then
     exit 1
 fi
 
-legacy_volume=false
 if [ -f "${STORAGE_MARKER}" ]; then
     storage_mode=$(tr -d '[:space:]' < "${STORAGE_MARKER}")
     case "${storage_mode}" in
         bind) ;;
-        volume) legacy_volume=true ;;
         *) echo "Invalid storage mode in ${STORAGE_MARKER}" >&2; exit 1 ;;
     esac
 else
     bind_has_data=false
     if [ -d "${STATE_DIR}" ] && [ -n "$(find "${STATE_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
         bind_has_data=true
-    fi
-
-    if [ -f "${QUADLET_DIR}/incus.container" ] && \
-       grep -q '^Volume=incus-data\.volume:/var/lib/incus$' "${QUADLET_DIR}/incus.container"; then
-        legacy_volume=true
-    elif podman volume exists "${LEGACY_VOLUME}"; then
-        echo "Podman volume ${LEGACY_VOLUME} exists without an installer storage marker." >&2
-        echo "Refusing to guess whether it contains this deployment's state." >&2
-        exit 1
     fi
 
     if [ "${bind_has_data}" = true ] && [ ! -f "${QUADLET_DIR}/incus.container" ] && [ "${adopt_bind}" != true ]; then
@@ -176,86 +163,6 @@ if [ "${target_user}" != root ] && \
     usermod --append --groups incus-admin "${target_user}"
 fi
 
-volume_migrated=false
-migration_active=false
-migration_dir=
-
-recover_legacy_service() {
-    if [ "${migration_active}" = true ]; then
-        [ -z "${migration_dir}" ] || rm -rf "${migration_dir}" || true
-        if [ -f "${QUADLET_DIR}/incus.container" ] && \
-           grep -q '^Volume=/var/lib/incus:/var/lib/incus$' "${QUADLET_DIR}/incus.container"; then
-            echo "Installation did not complete; starting Incus from migrated bind storage." >&2
-            if ! systemctl daemon-reload; then
-                echo "Could not load the bind-backed service; Incus remains stopped." >&2
-                return
-            fi
-        else
-            echo "Migration did not complete; restarting the volume-backed service." >&2
-        fi
-        systemctl start incus.service || true
-    fi
-}
-
-if [ "${legacy_volume}" = true ]; then
-    if ! podman volume exists "${LEGACY_VOLUME}"; then
-        echo "Storage mode is volume, but Podman volume ${LEGACY_VOLUME} does not exist." >&2
-        exit 1
-    fi
-
-    if [ -d "${STATE_DIR}" ] && \
-       [ -n "$(find "${STATE_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && \
-       [ ! -f "${MIGRATION_MARKER}" ]; then
-        echo "Refusing to migrate ${LEGACY_VOLUME}: ${STATE_DIR} is not empty." >&2
-        exit 1
-    fi
-
-    volume_mountpoint=$(podman volume inspect --format '{{.Mountpoint}}' "${LEGACY_VOLUME}")
-    migration_dir=/var/lib/.incus-volume-migration.$$
-    resume_bind_state=false
-    if [ -f "${MIGRATION_MARKER}" ] && \
-       [ -f "${QUADLET_DIR}/incus.container" ] && \
-       grep -q '^Volume=/var/lib/incus:/var/lib/incus$' "${QUADLET_DIR}/incus.container" && \
-       [ -d "${STATE_DIR}" ] && \
-       [ -n "$(find "${STATE_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-        resume_bind_state=true
-    fi
-
-    install -d -m 0755 "${QUADLET_DIR}"
-    printf '%s\n' "${LEGACY_VOLUME}" > "${MIGRATION_MARKER}"
-    chmod 0644 "${MIGRATION_MARKER}"
-    trap recover_legacy_service EXIT
-    trap 'exit 1' HUP INT TERM
-
-    echo "Stopping Incus to migrate ${LEGACY_VOLUME} to ${STATE_DIR}"
-    migration_active=true
-    systemctl stop incus.service
-
-    if [ "${resume_bind_state}" = true ]; then
-        echo "Resuming the interrupted migration from ${STATE_DIR}"
-        migration_dir=
-    else
-        if ! install -d -m 0700 "${migration_dir}" || \
-           ! cp -a "${volume_mountpoint}/." "${migration_dir}/" || \
-           ! chmod 0711 "${migration_dir}"; then
-            echo "Volume migration failed." >&2
-            exit 1
-        fi
-
-        if [ -d "${STATE_DIR}" ]; then
-            if [ -f "${MIGRATION_MARKER}" ] && \
-               [ -n "$(find "${STATE_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-                rm -rf "${STATE_DIR}"
-            else
-                rmdir "${STATE_DIR}"
-            fi
-        fi
-        mv "${migration_dir}" "${STATE_DIR}"
-        migration_dir=
-    fi
-    volume_migrated=true
-fi
-
 install -d -m 0711 "${STATE_DIR}"
 install -d -m 0750 -o "${target_user}" -g "${target_group}" "${STATE_DIR}/.config"
 install -d -m 0750 -o "${target_user}" -g "${target_group}" "${STATE_DIR}/.config/incus"
@@ -269,16 +176,11 @@ install -m 0644 "${script_dir}/quadlet/incus-environment.conf" \
     "${QUADLET_DIR}/incus.container.d/20-environment.conf"
 printf '[Container]\nEnvironment=INCUS_GID=%s\n' "${incus_gid}" > "${HOST_ACCESS_DROPIN}"
 chmod 0644 "${HOST_ACCESS_DROPIN}"
-rm -f "${QUADLET_DIR}/incus-data.volume" "${QUADLET_DIR}/incus.container.d/10-storage.conf"
 
 storage_marker_tmp=${STORAGE_MARKER}.$$
 printf '%s\n' bind > "${storage_marker_tmp}"
 chmod 0644 "${storage_marker_tmp}"
 mv "${storage_marker_tmp}" "${STORAGE_MARKER}"
-if [ "${volume_migrated}" = true ]; then
-    rm -f "${MIGRATION_MARKER}"
-fi
-
 if [ ! -e "${ENVIRONMENT_FILE}" ]; then
     install -m 0644 /dev/null "${ENVIRONMENT_FILE}"
 fi
@@ -313,10 +215,6 @@ fi
 
 systemctl daemon-reload
 systemctl restart incus.service
-if [ "${volume_migrated}" = true ]; then
-    migration_active=false
-    trap - EXIT HUP INT TERM
-fi
 
 if ! podman exec incus /usr/local/bin/incus-healthcheck; then
     echo "Incus did not become ready. Inspect it with:" >&2
@@ -333,9 +231,6 @@ if [ ! -S "${STATE_DIR}/unix.socket" ] || \
 fi
 
 echo "Incus is ready using ${STATE_DIR}."
-if [ "${volume_migrated}" = true ]; then
-    echo "The previous ${LEGACY_VOLUME} volume was retained as a migration backup."
-fi
 echo "Fallback client wrapper installed at ${target_home}/.local/bin/incus-container"
 echo "Ensure ${target_home}/.local/bin is in ${target_user}'s PATH."
 echo
