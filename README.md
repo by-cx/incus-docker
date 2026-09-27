@@ -5,7 +5,7 @@ Podman, Quadlet, and systemd. The image is based on Debian 13 (Trixie) and the
 [Zabbly Incus packages](https://github.com/zabbly/incus).
 
 The maintained installation path is `install.sh`. It creates a system service,
-keeps Incus state outside the image, installs a matching client wrapper, and
+keeps Incus state outside the image, installs a fallback client wrapper, and
 provides enough time for Incus to shut down its instances during service or
 host shutdown.
 
@@ -58,18 +58,27 @@ Clone the repository and run:
 sudo ./install.sh
 ```
 
-When run through `sudo`, the installer places the client wrapper in the
-invoking user's `~/.local/bin/incus`. Select a different user with:
+When run through `sudo`, the installer grants the invoking user access to the
+Incus socket and places a fallback client wrapper in
+`~/.local/bin/incus-container`. Select a different user with:
 
 ```sh
 sudo ./install.sh --user USER
 ```
 
-Ensure `~/.local/bin` is in that user's `PATH`, then initialize Incus if this
-is a new deployment:
+Log out and back in after the first installation so the new `incus-admin`
+membership applies. Install a native Incus client, ensure `~/.local/bin` is in
+the user's `PATH`, and initialize Incus if this is a new deployment:
 
 ```sh
 incus admin init
+```
+
+Before logging in again, or when no native client is installed, use the
+container fallback:
+
+```sh
+incus-container admin init
 ```
 
 ### What the installer does
@@ -77,7 +86,7 @@ incus admin init
 The script is safe to run repeatedly. On each run it:
 
 1. Elevates itself with `sudo` when necessary and identifies the user who
-   should receive the client wrapper.
+   should receive socket access and the fallback client wrapper.
 2. Checks required commands, cgroup v2, and the Podman Quadlet generator.
 3. Refuses to replace an existing `incus.service` that it does not manage,
    protecting a possible native Incus installation.
@@ -85,11 +94,14 @@ The script is safe to run repeatedly. On each run it:
    state created by an older version of this installer from its named volume.
 5. Validates the assembled Quadlet configuration before changing the installed
    service.
-6. Installs the Quadlet files under `/etc/containers/systemd` and creates
+6. Creates or reuses the host `incus-admin` group, adds the selected user, and
+   maps the container's `incus-admin` group to the same numeric GID.
+7. Installs the Quadlet files under `/etc/containers/systemd` and creates
    `/etc/incus-container.env` if it does not exist.
-7. Installs or updates `~/.local/bin/incus` for the selected user.
-8. Pulls `ghcr.io/by-cx/incus-docker:latest`.
-9. Reloads systemd, restarts `incus.service`, and checks that Incus becomes
+8. Installs or updates `~/.local/bin/incus-container` without replacing a
+   native `incus` client.
+9. Pulls `ghcr.io/by-cx/incus-docker:latest`.
+10. Reloads systemd, restarts `incus.service`, and checks that Incus becomes
    ready.
 
 The installer does not update its own Git checkout and does not overwrite an
@@ -99,9 +111,7 @@ existing `/etc/incus-container.env`.
 
 The Quadlet bind-mounts the host directory `/var/lib/incus` at the same path in
 the outer container. Image replacement therefore does not remove Incus
-databases, storage pools, instance data, or configuration. Keeping the same
-path on both sides also makes client-created SPICE sockets available to host
-applications.
+databases, storage pools, instance data, or configuration.
 
 The installer will not automatically adopt an unmarked, non-empty
 `/var/lib/incus`, because it might belong to a native Incus installation. To
@@ -140,6 +150,10 @@ KVM_GID=36
 
 `SETIPTABLES=true` inserts unrestricted `ACCEPT` rules into existing
 `DOCKER-USER` chains. It is normally unnecessary with Podman.
+
+The installer writes `INCUS_GID` to its managed
+`30-host-access.conf` Quadlet drop-in. Do not set it in the environment file;
+it must match the numeric GID of the host's `incus-admin` group.
 
 After changing the environment file, restart the service:
 
@@ -209,8 +223,10 @@ reset, or a guest that fails to stop before all configured timeouts expire.
 
 ## Client access
 
-The installed wrapper runs the image's matching Incus client inside the outer
-container:
+Use a native host Incus client for normal administration. The native client can
+access host files and launch desktop applications such as `remote-viewer`.
+Homebrew's Incus client and the official static client from the
+[Incus releases](https://github.com/lxc/incus/releases/latest) are suitable.
 
 ```sh
 incus list
@@ -218,32 +234,41 @@ incus launch images:debian/13 c1
 incus info c1
 ```
 
-Because Podman is rootful, the wrapper uses `sudo podman exec` for non-root
-users. The client process runs with the invoking host user's numeric UID and
-the container's `incus-admin` group. The installer assigns
-`/var/lib/incus/.config/incus` to the selected host user. Files and SPICE
-sockets created by the client are therefore owned by that user on the host.
-The wrapper preserves interactive terminals and supports pipelines.
+The daemon socket is `/var/lib/incus/unix.socket`, owned by
+`root:incus-admin` with mode `0660`. The installer creates the host group, adds
+the selected user, and configures the same numeric GID inside the outer
+container. A logout and login is required before the current desktop session
+receives new group membership. Membership grants full Incus administrator
+access and should be treated as equivalent to host root access.
+
+The `incus-container` fallback runs the image's matching client through
+`sudo podman exec`. It is useful for initial setup, recovery, or version
+troubleshooting, but it cannot launch applications in the host desktop
+session:
+
+```sh
+incus-container list
+incus-container info c1
+```
+
+The installer does not overwrite `~/.local/bin/incus`. During an upgrade it
+removes that file only if its checksum matches a wrapper released by this
+project; any native or modified client is preserved.
 
 ### Graphical VM console
 
-Start a VGA console proxy with:
+Install a host SPICE viewer such as `remote-viewer`, then run this with the
+native client:
 
 ```sh
 incus console VM_NAME --type vga
 ```
 
-The proxy socket is created under
-`/var/lib/incus/.config/incus/sockets/`. Keep the command running while a host
-SPICE client connects to the socket. Both the parent directory and newly
-created socket are accessible to the host user selected during installation.
-
-Host paths passed to commands such as `incus file push` are not visible unless
-they are also mounted inside the outer container. If native host path access is
-needed, use the official static client from the
-[Incus releases](https://github.com/lxc/incus/releases/latest) and connect over
-HTTPS. Copying `/usr/bin/incus` from this image is insufficient because the
-Zabbly wrapper depends on files under `/opt/incus`.
+The native Incus client creates the SPICE proxy in the user's client directory
+and starts the viewer in the host graphical session. Do not use
+`incus-container` for VGA consoles. Copying `/usr/bin/incus` from the image is
+not a substitute for a native client because the Zabbly wrapper depends on
+files under `/opt/incus`.
 
 ## Service management
 
@@ -283,12 +308,12 @@ sudo systemctl restart incus.service
 
 - `debian-version/`: image definition, entrypoint, and health check
 - `quadlet/`: portable Quadlet source files
-- `bin/incus`: host client wrapper installed by `install.sh`
+- `bin/incus-container`: fallback container client installed by `install.sh`
 - `install.sh`: idempotent install and update script
 
 The installer is preferred over manual Quadlet installation because it handles
 storage selection, state protection, image pulls, validation, service updates,
-and the client wrapper together.
+and the fallback client wrapper together.
 
 ## License
 

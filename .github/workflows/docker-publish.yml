@@ -42,8 +42,9 @@ jobs:
 
       - name: Validate scripts
         run: |
-          sh -n install.sh bin/incus debian-version/incus-healthcheck
+          sh -n install.sh bin/incus-container debian-version/incus-healthcheck
           bash -n debian-version/incus-entrypoint
+          test -x bin/incus-container
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

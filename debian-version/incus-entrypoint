@@ -41,6 +41,16 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+if [[ -n "${INCUS_GID:-}" ]]; then
+    if [[ ! "${INCUS_GID}" =~ ^[0-9]+$ ]]; then
+        echo "INCUS_GID must be numeric" >&2
+        exit 1
+    fi
+
+    echo "Matching the container incus-admin group to host GID ${INCUS_GID}"
+    groupmod --non-unique -g "${INCUS_GID}" incus-admin
+fi
+
 if [[ -n "${KVM_GID:-}" ]] && getent group kvm >/dev/null; then
     echo "Matching the container kvm group to host GID ${KVM_GID}"
     groupmod --non-unique -g "${KVM_GID}" kvm

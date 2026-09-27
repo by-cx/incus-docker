@@ -9,12 +9,13 @@ STORAGE_MARKER=${QUADLET_DIR}/incus-storage-mode
 MIGRATION_MARKER=${QUADLET_DIR}/incus-volume-migration
 STATE_DIR=/var/lib/incus
 LEGACY_VOLUME=incus-data
+HOST_ACCESS_DROPIN=${QUADLET_DIR}/incus.container.d/30-host-access.conf
 
 usage() {
     cat <<EOF
 Usage: ${PROGRAM_NAME} [--user USER] [--adopt-bind]
 
-Install or update the Incus Quadlet and the invoking user's client wrapper.
+Install or update the Incus Quadlet and the invoking user's fallback client wrapper.
 Run this script again after updating the checkout to update the deployment.
 EOF
 }
@@ -68,7 +69,7 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-for command in chmod chown cp cut find getent grep install mktemp mv podman rm rmdir systemctl tr; do
+for command in chmod chown cp cut find getent grep groupadd install mktemp mv podman rm rmdir sha256sum stat systemctl tr usermod; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         echo "Required command not found: ${command}" >&2
         exit 1
@@ -82,6 +83,7 @@ fi
 
 target_home=$(getent passwd "${target_user}" | cut -d: -f6)
 target_group=$(id -gn "${target_user}")
+user_added_to_incus=false
 
 if [ "${target_user}" != root ] && ! command -v sudo >/dev/null 2>&1; then
     echo "sudo is required by the client wrapper for rootful Podman." >&2
@@ -155,10 +157,26 @@ install -m 0644 "${script_dir}/quadlet/incus.container" "${validation_dir}/incus
 install -d -m 0755 "${validation_dir}/incus.container.d"
 install -m 0644 "${script_dir}/quadlet/incus-environment.conf" \
     "${validation_dir}/incus.container.d/20-environment.conf"
+printf '[Container]\nEnvironment=INCUS_GID=0\n' \
+    > "${validation_dir}/incus.container.d/30-host-access.conf"
 
 QUADLET_UNIT_DIRS="${validation_dir}" "${quadlet_generator}" --dryrun >/dev/null
 cleanup_validation
 trap - EXIT HUP INT TERM
+
+if ! getent group incus-admin >/dev/null; then
+    groupadd --system incus-admin
+fi
+incus_gid=$(getent group incus-admin | cut -d: -f3)
+case "${incus_gid}" in
+    ''|*[!0-9]*) echo "Could not determine the host incus-admin GID." >&2; exit 1 ;;
+esac
+
+if [ "${target_user}" != root ] && \
+   ! id -nG "${target_user}" | tr ' ' '\n' | grep -qx incus-admin; then
+    usermod --append --groups incus-admin "${target_user}"
+    user_added_to_incus=true
+fi
 
 volume_migrated=false
 migration_active=false
@@ -251,6 +269,8 @@ install -m 0644 "${script_dir}/quadlet/incus.container" "${QUADLET_DIR}/incus.co
 install -d -m 0755 "${QUADLET_DIR}/incus.container.d"
 install -m 0644 "${script_dir}/quadlet/incus-environment.conf" \
     "${QUADLET_DIR}/incus.container.d/20-environment.conf"
+printf '[Container]\nEnvironment=INCUS_GID=%s\n' "${incus_gid}" > "${HOST_ACCESS_DROPIN}"
+chmod 0644 "${HOST_ACCESS_DROPIN}"
 rm -f "${QUADLET_DIR}/incus-data.volume" "${QUADLET_DIR}/incus.container.d/10-storage.conf"
 
 storage_marker_tmp=${STORAGE_MARKER}.$$
@@ -267,10 +287,25 @@ fi
 
 install -d -m 0755 -o "${target_user}" -g "${target_group}" "${target_home}/.local/bin"
 install -m 0755 -o "${target_user}" -g "${target_group}" \
-    "${script_dir}/bin/incus" "${target_home}/.local/bin/incus"
+    "${script_dir}/bin/incus-container" "${target_home}/.local/bin/incus-container"
+
+legacy_wrapper=${target_home}/.local/bin/incus
+if [ -f "${legacy_wrapper}" ]; then
+    legacy_wrapper_hash=$(sha256sum "${legacy_wrapper}" | cut -d' ' -f1)
+    case "${legacy_wrapper_hash}" in
+        54affc6ae05eebf54ade8d5aebea206bc7516be06272ce43db1182e7e3e27f63|\
+        9592a861372541411bdecb1919be732f96649d7623cd7e1ad9b6bb543b595a64)
+            rm -f "${legacy_wrapper}"
+            echo "Removed the legacy ~/.local/bin/incus wrapper."
+            ;;
+        *)
+            echo "Preserving existing ${legacy_wrapper}; it is not a recognized managed wrapper."
+            ;;
+    esac
+fi
 
 if command -v restorecon >/dev/null 2>&1; then
-    restorecon -RF "${QUADLET_DIR}" "${ENVIRONMENT_FILE}" "${target_home}/.local/bin/incus" || true
+    restorecon -RF "${QUADLET_DIR}" "${ENVIRONMENT_FILE}" "${target_home}/.local/bin/incus-container" || true
 fi
 
 echo "Pulling ${IMAGE}"
@@ -292,9 +327,19 @@ if ! podman exec incus /usr/local/bin/incus-healthcheck; then
     exit 1
 fi
 
+if [ ! -S "${STATE_DIR}/unix.socket" ] || \
+   [ "$(stat -c '%g' "${STATE_DIR}/unix.socket")" != "${incus_gid}" ]; then
+    echo "Incus is ready, but ${STATE_DIR}/unix.socket does not use host incus-admin GID ${incus_gid}." >&2
+    echo "Make sure the pulled image includes INCUS_GID support, then rerun the installer." >&2
+    exit 1
+fi
+
 echo "Incus is ready using ${STATE_DIR}."
 if [ "${volume_migrated}" = true ]; then
     echo "The previous ${LEGACY_VOLUME} volume was retained as a migration backup."
 fi
-echo "Client wrapper installed at ${target_home}/.local/bin/incus"
+echo "Fallback client wrapper installed at ${target_home}/.local/bin/incus-container"
 echo "Ensure ${target_home}/.local/bin is in ${target_user}'s PATH."
+if [ "${user_added_to_incus}" = true ]; then
+    echo "Log out and back in before using a native Incus client as ${target_user}."
+fi
