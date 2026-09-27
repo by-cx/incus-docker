@@ -83,7 +83,6 @@ fi
 
 target_home=$(getent passwd "${target_user}" | cut -d: -f6)
 target_group=$(id -gn "${target_user}")
-user_added_to_incus=false
 
 if [ "${target_user}" != root ] && ! command -v sudo >/dev/null 2>&1; then
     echo "sudo is required by the client wrapper for rootful Podman." >&2
@@ -175,7 +174,6 @@ esac
 if [ "${target_user}" != root ] && \
    ! id -nG "${target_user}" | tr ' ' '\n' | grep -qx incus-admin; then
     usermod --append --groups incus-admin "${target_user}"
-    user_added_to_incus=true
 fi
 
 volume_migrated=false
@@ -340,6 +338,8 @@ if [ "${volume_migrated}" = true ]; then
 fi
 echo "Fallback client wrapper installed at ${target_home}/.local/bin/incus-container"
 echo "Ensure ${target_home}/.local/bin is in ${target_user}'s PATH."
-if [ "${user_added_to_incus}" = true ]; then
-    echo "Log out and back in before using a native Incus client as ${target_user}."
-fi
+echo
+echo "Native Incus client setup for ${target_user}:"
+echo "  sudo usermod -G incus-admin -a ${target_user}"
+echo "  brew install incus"
+echo "Log out and back in before using the native Incus client."
