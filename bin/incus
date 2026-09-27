@@ -27,7 +27,9 @@ if ! sudo podman container exists incus; then
 fi
 
 if [ -t 0 ] && [ -t 1 ]; then
-    exec sudo podman exec --interactive --tty incus /usr/bin/incus "$@"
+    exec sudo podman exec --interactive --tty \
+        --user "$(id -u):incus-admin" incus /usr/bin/incus "$@"
 fi
 
-exec sudo podman exec --interactive incus /usr/bin/incus "$@"
+exec sudo podman exec --interactive \
+    --user "$(id -u):incus-admin" incus /usr/bin/incus "$@"

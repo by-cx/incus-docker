@@ -81,13 +81,14 @@ The script is safe to run repeatedly. On each run it:
 2. Checks required commands, cgroup v2, and the Podman Quadlet generator.
 3. Refuses to replace an existing `incus.service` that it does not manage,
    protecting a possible native Incus installation.
-4. Selects persistent storage and refuses ambiguous state locations.
+4. Validates or adopts the persistent state at `/var/lib/incus` and migrates
+   state created by an older version of this installer from its named volume.
 5. Validates the assembled Quadlet configuration before changing the installed
    service.
-6. Pulls `ghcr.io/by-cx/incus-docker:latest`.
-7. Installs the Quadlet files under `/etc/containers/systemd` and creates
+6. Installs the Quadlet files under `/etc/containers/systemd` and creates
    `/etc/incus-container.env` if it does not exist.
-8. Installs or updates `~/.local/bin/incus` for the selected user.
+7. Installs or updates `~/.local/bin/incus` for the selected user.
+8. Pulls `ghcr.io/by-cx/incus-docker:latest`.
 9. Reloads systemd, restarts `incus.service`, and checks that Incus becomes
    ready.
 
@@ -96,22 +97,30 @@ existing `/etc/incus-container.env`.
 
 ### Persistent storage
 
-A clean installation creates the Podman volume `incus-data` and mounts it at
-`/var/lib/incus`. Image replacement therefore does not remove Incus databases,
-storage pools, instance data, or configuration.
+The Quadlet bind-mounts the host directory `/var/lib/incus` at the same path in
+the outer container. Image replacement therefore does not remove Incus
+databases, storage pools, instance data, or configuration. Keeping the same
+path on both sides also makes client-created SPICE sockets available to host
+applications.
 
-Older deployments might already use the host directory `/var/lib/incus`. The
-installer continues using that bind mount when a previous installation has
-recorded it. To adopt an existing directory intentionally on the first run:
+The installer will not automatically adopt an unmarked, non-empty
+`/var/lib/incus`, because it might belong to a native Incus installation. To
+adopt an existing directory intentionally on the first run:
 
 ```sh
 sudo ./install.sh --adopt-bind
 ```
 
-The installer will not automatically adopt an unmarked, non-empty
-`/var/lib/incus`, because it might belong to a native installation. It also
-stops if both that directory and the `incus-data` volume could contain state.
-The selected mode is recorded in
+Installations made by an earlier version of this installer might use the
+Podman volume `incus-data`. When its storage marker says `volume`, or the
+installed legacy Quadlet clearly references that volume, an update stops
+Incus, copies the volume to `/var/lib/incus`, switches the Quadlet to the bind
+mount, and then starts Incus from the copied state. Migration is refused if
+`/var/lib/incus` contains unrelated data. Interrupted installer migrations are
+resumed without overwriting an already activated bind copy. The old volume is
+retained as a backup and is not removed automatically.
+
+The selected bind mode is recorded in
 `/etc/containers/systemd/incus-storage-mode` and reused on future runs.
 
 Back up Incus before upgrades. Incus can migrate its database schema forward,
@@ -210,7 +219,24 @@ incus info c1
 ```
 
 Because Podman is rootful, the wrapper uses `sudo podman exec` for non-root
-users. It preserves interactive terminals and supports pipelines.
+users. The client process runs with the invoking host user's numeric UID and
+the container's `incus-admin` group. The installer assigns
+`/var/lib/incus/.config/incus` to the selected host user. Files and SPICE
+sockets created by the client are therefore owned by that user on the host.
+The wrapper preserves interactive terminals and supports pipelines.
+
+### Graphical VM console
+
+Start a VGA console proxy with:
+
+```sh
+incus console VM_NAME --type vga
+```
+
+The proxy socket is created under
+`/var/lib/incus/.config/incus/sockets/`. Keep the command running while a host
+SPICE client connects to the socket. Both the parent directory and newly
+created socket are accessible to the host user selected during installation.
 
 Host paths passed to commands such as `incus file push` are not visible unless
 they are also mounted inside the outer container. If native host path access is
@@ -234,8 +260,8 @@ is disabled; use the systemd journal and Incus logs for diagnostics.
 
 ## Custom host mounts
 
-The default service does not mount `/dev`, a home directory, host firmware, or
-a fixed host state directory on clean installations. Privileged Podman exposes
+The default service does not mount `/dev`, a home directory, or host firmware.
+It bind-mounts `/var/lib/incus` for persistent state. Privileged Podman exposes
 the required devices, and `/lib/modules` is mounted read-only because modules
 must match the running host kernel.
 

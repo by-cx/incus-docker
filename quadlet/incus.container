@@ -9,7 +9,7 @@ ContainerName=incus
 Pull=never
 
 Network=host
-Volume=incus-data.volume:/var/lib/incus
+Volume=/var/lib/incus:/var/lib/incus
 Volume=/lib/modules:/lib/modules:ro
 
 CgroupsMode=no-conmon
