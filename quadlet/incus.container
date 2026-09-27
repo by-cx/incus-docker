@@ -13,7 +13,12 @@ Volume=/var/lib/incus:/var/lib/incus
 Volume=/lib/modules:/lib/modules:ro
 
 CgroupsMode=no-conmon
+HealthCmd=/usr/local/bin/incus-healthcheck
+HealthInterval=30s
 HealthOnFailure=kill
+HealthRetries=3
+HealthStartPeriod=60s
+HealthTimeout=10s
 LogDriver=none
 Notify=healthy
 PidsLimit=0
