@@ -2,26 +2,44 @@
 set -eu
 
 PROGRAM_NAME=${0##*/}
-IMAGE=ghcr.io/by-cx/incus-docker:latest
+IMAGE_REPOSITORY=ghcr.io/by-cx/incus-docker
 QUADLET_DIR=/etc/containers/systemd
 ENVIRONMENT_FILE=/etc/incus-container.env
 STORAGE_MARKER=${QUADLET_DIR}/incus-storage-mode
 STATE_DIR=/var/lib/incus
+IMAGE_DROPIN=${QUADLET_DIR}/incus.container.d/10-image.conf
 HOST_ACCESS_DROPIN=${QUADLET_DIR}/incus.container.d/30-host-access.conf
 
 usage() {
     cat <<EOF
-Usage: ${PROGRAM_NAME} [--user USER] [--adopt-bind]
+Usage: ${PROGRAM_NAME} [--branch BRANCH] [--update-strategy STRATEGY]
+       [--user USER] [--adopt-bind]
 
 Install or update the Incus Quadlet and the invoking user's fallback client wrapper.
 Run this script again after updating the checkout to update the deployment.
+
+  --branch BRANCH            Image branch: latest, lts, or daily (default: latest)
+  --update-strategy STRATEGY Instance handling: naive, shutdown, or suspend
+                             (default: suspend)
 EOF
 }
 
 target_user=
 adopt_bind=false
+branch=latest
+update_strategy=suspend
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --branch)
+            [ "$#" -ge 2 ] || { echo "--branch requires a value" >&2; exit 2; }
+            branch=$2
+            shift 2
+            ;;
+        --update-strategy)
+            [ "$#" -ge 2 ] || { echo "--update-strategy requires a value" >&2; exit 2; }
+            update_strategy=$2
+            shift 2
+            ;;
         --user)
             [ "$#" -ge 2 ] || { echo "--user requires a value" >&2; exit 2; }
             target_user=$2
@@ -43,18 +61,27 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ "$(id -u)" -ne 0 ]; then
-    if [ -n "${target_user}" ]; then
-        if [ "${adopt_bind}" = true ]; then
-            exec sudo "$0" --user "${target_user}" --adopt-bind
-        fi
-        exec sudo "$0" --user "${target_user}"
-    fi
+case "${branch}" in
+    latest|lts|daily) ;;
+    *) echo "Invalid branch: ${branch}. Expected latest, lts, or daily." >&2; exit 2 ;;
+esac
 
-    if [ "${adopt_bind}" = true ]; then
-        exec sudo "$0" --adopt-bind
+case "${update_strategy}" in
+    naive|shutdown|suspend) ;;
+    *) echo "Invalid update strategy: ${update_strategy}. Expected naive, shutdown, or suspend." >&2; exit 2 ;;
+esac
+
+IMAGE=${IMAGE_REPOSITORY}:${branch}
+
+if [ "$(id -u)" -ne 0 ]; then
+    set -- --branch "${branch}" --update-strategy "${update_strategy}"
+    if [ -n "${target_user}" ]; then
+        set -- --user "${target_user}" "$@"
     fi
-    exec sudo "$0"
+    if [ "${adopt_bind}" = true ]; then
+        set -- "$@" --adopt-bind
+    fi
+    exec sudo "$0" "$@"
 fi
 
 if [ -z "${target_user}" ]; then
@@ -137,18 +164,25 @@ validation_dir=$(mktemp -d)
 cleanup_validation() {
     rm -rf "${validation_dir}"
 }
-trap cleanup_validation EXIT HUP INT TERM
+trap cleanup_validation 0 HUP INT TERM
 
 install -m 0644 "${script_dir}/quadlet/incus.container" "${validation_dir}/incus.container"
 install -d -m 0755 "${validation_dir}/incus.container.d"
 install -m 0644 "${script_dir}/quadlet/incus-environment.conf" \
     "${validation_dir}/incus.container.d/20-environment.conf"
+printf '[Container]\nImage=%s\n' "${IMAGE}" \
+    > "${validation_dir}/incus.container.d/10-image.conf"
 printf '[Container]\nEnvironment=INCUS_GID=0\n' \
     > "${validation_dir}/incus.container.d/30-host-access.conf"
 
 QUADLET_UNIT_DIRS="${validation_dir}" "${quadlet_generator}" --dryrun >/dev/null
 cleanup_validation
-trap - EXIT HUP INT TERM
+trap - 0 HUP INT TERM
+
+echo "Pulling ${IMAGE}"
+if ! podman pull "${IMAGE}"; then
+    exit 1
+fi
 
 if ! getent group incus-admin >/dev/null; then
     groupadd --system incus-admin
@@ -172,6 +206,8 @@ chown -R "${target_user}:${target_group}" "${STATE_DIR}/.config/incus"
 install -d -m 0755 "${QUADLET_DIR}"
 install -m 0644 "${script_dir}/quadlet/incus.container" "${QUADLET_DIR}/incus.container"
 install -d -m 0755 "${QUADLET_DIR}/incus.container.d"
+printf '[Container]\nImage=%s\n' "${IMAGE}" > "${IMAGE_DROPIN}"
+chmod 0644 "${IMAGE_DROPIN}"
 install -m 0644 "${script_dir}/quadlet/incus-environment.conf" \
     "${QUADLET_DIR}/incus.container.d/20-environment.conf"
 printf '[Container]\nEnvironment=INCUS_GID=%s\n' "${incus_gid}" > "${HOST_ACCESS_DROPIN}"
@@ -208,9 +244,77 @@ if command -v restorecon >/dev/null 2>&1; then
     restorecon -RF "${QUADLET_DIR}" "${ENVIRONMENT_FILE}" "${target_home}/.local/bin/incus-container" || true
 fi
 
-echo "Pulling ${IMAGE}"
-if ! podman pull "${IMAGE}"; then
-    exit 1
+running_instances=
+instances_prepared=false
+update_complete=false
+
+instance_is_running() {
+    project=$1
+    instance=$2
+    running_names=$(podman exec incus incus list --project "${project}" status=running \
+        --format csv -c n) || return 2
+    printf '%s\n' "${running_names}" | grep -Fxq "${instance}"
+}
+
+start_recorded_instances() {
+    while IFS=, read -r project instance; do
+        [ -n "${project}" ] && [ -n "${instance}" ] || continue
+        if instance_is_running "${project}" "${instance}"; then
+            continue
+        else
+            status=$?
+            [ "${status}" -eq 1 ] || return "${status}"
+        fi
+        echo "Starting ${project}/${instance}"
+        podman exec incus incus start --project "${project}" "${instance}"
+    done < "${running_instances}"
+}
+
+recover_instances() {
+    status=$?
+    trap - 0 HUP INT TERM
+    if [ "${instances_prepared}" = true ] && [ "${update_complete}" != true ]; then
+        echo "Update did not complete; attempting to restart the previous instances." >&2
+        systemctl start incus.service >/dev/null 2>&1 || true
+        if podman exec incus /usr/local/bin/incus-healthcheck >/dev/null 2>&1; then
+            start_recorded_instances || true
+        else
+            echo "Incus is not ready; the previous instances could not be restarted." >&2
+        fi
+    fi
+    [ -z "${running_instances}" ] || rm -f "${running_instances}"
+    exit "${status}"
+}
+
+if [ "${update_strategy}" != naive ] && systemctl is-active --quiet incus.service; then
+    running_instances=$(mktemp)
+    trap recover_instances 0
+    trap 'exit 1' HUP INT TERM
+    podman exec incus incus list --all-projects status=running \
+        --format csv -c en > "${running_instances}"
+    instances_prepared=true
+
+    while IFS=, read -r project instance; do
+        [ -n "${project}" ] && [ -n "${instance}" ] || continue
+        case "${update_strategy}" in
+            shutdown)
+                echo "Shutting down ${project}/${instance}"
+                podman exec incus incus stop --timeout 300 --project "${project}" "${instance}"
+                ;;
+            suspend)
+                echo "Suspending ${project}/${instance}"
+                if ! podman exec incus incus stop --stateful --timeout 300 --project "${project}" "${instance}"; then
+                    echo "Stateful suspension is unavailable for ${project}/${instance}; shutting it down instead." >&2
+                    if instance_is_running "${project}" "${instance}"; then
+                        podman exec incus incus stop --timeout 300 --project "${project}" "${instance}"
+                    else
+                        status=$?
+                        [ "${status}" -eq 1 ] || exit "${status}"
+                    fi
+                fi
+                ;;
+        esac
+    done < "${running_instances}"
 fi
 
 systemctl daemon-reload
@@ -230,7 +334,15 @@ if [ ! -S "${STATE_DIR}/unix.socket" ] || \
     exit 1
 fi
 
+if [ "${instances_prepared}" = true ]; then
+    start_recorded_instances
+    update_complete=true
+    trap - 0 HUP INT TERM
+    rm -f "${running_instances}"
+fi
+
 echo "Incus is ready using ${STATE_DIR}."
+echo "Image branch: ${branch}; update strategy: ${update_strategy}."
 echo "Fallback client wrapper installed at ${target_home}/.local/bin/incus-container"
 echo "Ensure ${target_home}/.local/bin is in ${target_user}'s PATH."
 echo

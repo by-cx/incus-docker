@@ -22,7 +22,8 @@ Images are published for `linux/amd64` and `linux/arm64`:
 | `ghcr.io/by-cx/incus-docker:daily` | `daily` | Development builds; not recommended for production |
 | `ghcr.io/by-cx/incus-docker:lts` | `lts-7.0` | Incus 7.0 LTS |
 
-The installer uses `:latest`. All channels are built from
+The installer uses `:latest` by default. Select another image with
+`--branch lts` or `--branch daily`. All channels are built from
 `debian-version/Dockerfile` on the `main` branch. Builds run after changes to
 `main`, once per day, and when manually dispatched.
 
@@ -66,6 +67,16 @@ Incus socket and places a fallback client wrapper in
 sudo ./install.sh --user USER
 ```
 
+Select an image branch and update behavior with:
+
+```sh
+sudo ./install.sh --branch lts --update-strategy shutdown
+```
+
+`--branch` accepts `latest`, `lts`, or `daily` and defaults to `latest` on
+every run. `--update-strategy` accepts `naive`, `shutdown`, or `suspend` and
+defaults to `suspend`. The strategy has no effect during the first install.
+
 Log out and back in after the first installation so the new `incus-admin`
 membership applies. Install a native Incus client, ensure `~/.local/bin` is in
 the user's `PATH`, and initialize Incus if this is a new deployment:
@@ -93,15 +104,16 @@ The script is safe to run repeatedly. On each run it:
 4. Validates or adopts the persistent state at `/var/lib/incus`.
 5. Validates the assembled Quadlet configuration before changing the installed
    service.
-6. Creates or reuses the host `incus-admin` group, adds the selected user, and
+6. Pulls the selected image branch.
+7. Creates or reuses the host `incus-admin` group, adds the selected user, and
    maps the container's `incus-admin` group to the same numeric GID.
-7. Installs the Quadlet files under `/etc/containers/systemd` and creates
+8. Installs the Quadlet files under `/etc/containers/systemd` and creates
    `/etc/incus-container.env` if it does not exist.
-8. Installs or updates `~/.local/bin/incus-container` without replacing a
+9. Installs or updates `~/.local/bin/incus-container` without replacing a
    native `incus` client.
-9. Pulls `ghcr.io/by-cx/incus-docker:latest`.
-10. Reloads systemd, restarts `incus.service`, and checks that Incus becomes
-   ready.
+10. Applies the selected update strategy when the service is already running.
+11. Reloads systemd, restarts `incus.service`, restores the instances that were
+    running before the update, and checks that Incus becomes ready.
 
 The installer does not update its own Git checkout and does not overwrite an
 existing `/etc/incus-container.env`.
@@ -161,19 +173,41 @@ git pull --ff-only
 sudo ./install.sh
 ```
 
-The installer always pulls the current `:latest` image before restarting the
-service. The Quadlet uses `Pull=never` so service starts use that explicitly
-pulled local image rather than performing an uncontrolled pull during boot.
+The installer pulls the selected image before interrupting any instances. The
+Quadlet uses `Pull=never` so service starts use that explicitly pulled local
+image rather than performing an uncontrolled pull during boot. Because
+`--branch` defaults to `latest` on every run, pass `--branch lts` or
+`--branch daily` on each update to remain on that branch.
 
-An update has these effects:
+The update strategy controls how instances that are running across all projects
+are handled:
 
-1. The existing service receives `SIGTERM`.
-2. Incus gracefully shuts down its running instances.
-3. Podman replaces the outer container with the newly pulled image.
-4. Incus starts against the same persistent state.
-5. Instances start according to `boot.autostart`; its default `last-state`
-   behavior restores instances that were running.
-6. The installer waits for `incus admin waitready` before reporting success.
+- `suspend` is the default. The installer attempts a stateful stop, preserving
+  instance memory, then restores the instance after the update. Stateful stops
+  require `migration.stateful=true` and compatible devices. An instance that
+  cannot be statefully stopped within 300 seconds is shut down gracefully
+  instead.
+- `shutdown` gracefully stops each running instance, waiting up to 300 seconds
+  per instance before Incus force-stops it, then replaces the outer container.
+  It then starts the previously running instances again.
+- `naive` performs no explicit instance preparation. The service restart still
+  invokes the entrypoint's normal `incus admin shutdown` hook, and Incus
+  restores instances according to `boot.autostart` and their last state.
+
+For `suspend` and `shutdown`, the installer explicitly restarts only the
+previously running set. Incus can additionally start an instance configured
+with `boot.autostart=true`, even if it was stopped before the update. If the
+update fails after preparing instances, the installer makes a best-effort
+attempt to start the previously running set again. It cannot restore the old
+image automatically if the selected image fails to start.
+
+Stateful runtime data can depend on the Incus, QEMU, and CRIU versions that
+created it. Use `shutdown` rather than `suspend` when changing to an older image
+branch or when stateful restore compatibility is uncertain.
+
+Switching from `daily` or `latest` to `lts` can be a database downgrade. Back
+up Incus first; an older Incus release might not understand a database schema
+that a newer release has already upgraded.
 
 Updating therefore causes an outage for running instances; it is not a live
 daemon replacement. Schedule production updates accordingly. Running only
@@ -206,8 +240,8 @@ Increase the timeout for a VM that needs longer to shut down cleanly:
 incus config set VM_NAME boot.host_shutdown_timeout 120
 ```
 
-Use `boot.stop.priority` to control instance shutdown order. The same shutdown
-path runs for `systemctl stop`, `systemctl restart`, installer updates, and
+Use `boot.stop.priority` to control instance shutdown order. This shutdown path
+runs for `systemctl stop`, `systemctl restart`, `naive` installer updates, and
 normal host reboots. It cannot protect instances from power loss, a forced host
 reset, or a guest that fails to stop before all configured timeouts expire.
 
