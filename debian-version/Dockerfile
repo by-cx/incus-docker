@@ -55,6 +55,11 @@ RUN set -eux; \
         iproute2 \
         iptables \
         kmod \
+        libegl-mesa0 \
+        libegl1 \
+        libgl1 \
+        libgl1-mesa-dri \
+        libopengl0 \
         lvm2 \
         nftables \
         openvswitch-switch \
